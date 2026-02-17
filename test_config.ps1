@@ -1,21 +1,24 @@
-# generate-and-validate-config.ps1
-# Fetches routes from Artifactory, generates simplified nginx location blocks,
-# and validates for issues. Use to debug config generation errors locally.
+# windows-generate-config.ps1
+# Fetches repository list from Artifactory API, validates paths, deduplicates routes,
+# and generates both a routes YAML file and an nginx config preview for debugging.
 #
 # Usage:
-#   .\generate-and-validate-config.ps1 -ApiUrl https://artifactory.company.com -AuthToken <token>
-#   .\generate-and-validate-config.ps1 -ApiUrl https://artifactory.company.com -AuthToken "user:pass"
-#   .\generate-and-validate-config.ps1 -ApiUrl https://artifactory.company.com -AuthToken <token> -UpstreamFqdn artifactory.company.com
+#   .\windows-generate-config.ps1 -FQDN https://artifactory.company.com/artifactory -AuthToken <token>
+#   .\windows-generate-config.ps1 -FQDN https://artifactory.company.com/artifactory -AuthToken "user:pass" -UpstreamFqdn artifactory.company.com
+#   .\windows-generate-config.ps1 -FQDN https://artifactory.company.com/artifactory -AuthToken <token> -IgnoreSslErrors
 
 param(
-    [Parameter(Mandatory=$true, HelpMessage="Artifactory base URL (e.g., https://artifactory.company.com)")]
-    [string]$ApiUrl,
+    [Parameter(Mandatory=$true, HelpMessage="Artifactory base URL (e.g., https://mycompany.jfrog.io/artifactory)")]
+    [string]$FQDN,
     
     [Parameter(Mandatory=$true, HelpMessage="API token or username:password")]
     [string]$AuthToken,
     
     [Parameter(Mandatory=$false)]
-    [string]$OutputFile = "path-routing-preview.conf",
+    [string]$OutputFile = "artifactory-routes.yml",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$NginxPreviewFile = "path-routing-preview.conf",
     
     [Parameter(Mandatory=$false)]
     [string]$UpstreamFqdn = "",
@@ -44,7 +47,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# --- Nginx-unsafe characters (will break location directives) ---
+# ============================================================================
+# Path Validation — matches Python validate_nginx_path()
+# Characters that break nginx config syntax in location directives
+# ============================================================================
 $InvalidPathChars = @(' ', "`t", '{', '}', ';', '#', '"', "'")
 
 function Test-NginxPath {
@@ -71,7 +77,9 @@ function Get-InvalidChars {
     return $found -join ', '
 }
 
-# --- Ecosystem mapping (matches Python ArtifactoryClient) ---
+# ============================================================================
+# Ecosystem Mapping — matches Python ARTIFACTORY_PACKAGE_TYPE_MAP
+# ============================================================================
 $EcosystemMap = @{
     'maven'  = 'maven'
     'npm'    = 'npm'
@@ -82,12 +90,14 @@ $EcosystemMap = @{
     'nuget'  = 'nuget'
 }
 
-# --- SSL handling ---
+# ============================================================================
+# SSL Configuration
+# ============================================================================
 if ($IgnoreSslErrors) {
     Write-Host "WARNING: SSL certificate verification disabled" -ForegroundColor Yellow
-    # For PowerShell 7+
+    # PowerShell 7+
     $PSDefaultParameterValues['Invoke-RestMethod:SkipCertificateCheck'] = $true
-    # For PowerShell 5.1
+    # PowerShell 5.1
     if ($PSVersionTable.PSVersion.Major -le 5) {
         Add-Type @"
 using System.Net;
@@ -100,7 +110,9 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     }
 }
 
-# --- Authentication ---
+# ============================================================================
+# Authentication
+# ============================================================================
 $headers = @{ 'Content-Type' = 'application/json' }
 if ($AuthToken.Contains(':')) {
     Write-Host "Auth: Basic (username:password)"
@@ -111,25 +123,35 @@ if ($AuthToken.Contains(':')) {
     $headers['X-JFrog-Art-Api'] = $AuthToken
 }
 
-# --- Fetch repositories ---
-$repoUrl = "$($ApiUrl.TrimEnd('/'))/api/repositories"
+# ============================================================================
+# Fetch Repositories
+# ============================================================================
+$repoUrl = "$($FQDN.TrimEnd('/'))/api/repositories"
 Write-Host "Fetching repositories from: $repoUrl"
+Write-Host "Include pattern: $IncludePattern"
+Write-Host "Exclude pattern: $ExcludePattern"
+Write-Host ""
 
 try {
-    $repos = Invoke-RestMethod -Uri $repoUrl -Headers $headers -Method Get
-    Write-Host "Found $($repos.Count) repositories" -ForegroundColor Green
+    $response = Invoke-RestMethod -Uri $repoUrl -Headers $headers -Method Get
+    Write-Host "Found $($response.Count) repositories" -ForegroundColor Green
 } catch {
     Write-Error "Failed to fetch repositories: $_"
     exit 1
 }
 
-# --- Generate routes (same logic as Python ArtifactoryClient) ---
-$routes = @()
+# ============================================================================
+# Generate Routes — matches Python ArtifactoryClient.generate_routes()
+# With path validation + deduplication
+# ============================================================================
+$allRoutes = @()
 $skippedUnsupported = 0
 $skippedFiltered = 0
 $invalidPaths = @()
+$seenPaths = @{}  # path -> index in $allRoutes for deduplication
+$skippedDuplicates = 0
 
-foreach ($repo in $repos) {
+foreach ($repo in $response) {
     $repoKey = $repo.key
     $repoType = $repo.type
     $packageType = $repo.packageType.ToLower()
@@ -160,28 +182,7 @@ foreach ($repo in $repos) {
     }
     $path = $path.TrimEnd('/')
 
-    # Determine upstream
-    if ($UpstreamFqdn) {
-        $upstream = "$RewriteScheme`://$UpstreamFqdn$path"
-    } else {
-        if ($repoUrlField) {
-            $upstream = $repoUrlField
-        } else {
-            $upHost = ($ApiUrl -replace '^https?://', '').Split('/')[0]
-            $upstream = "$RewriteScheme`://$upHost$path"
-        }
-    }
-
-    # Determine needs_rewrite
-    $upstreamNoScheme = $upstream -replace '^https?://', ''
-    if ($upstreamNoScheme.Contains('/')) {
-        $upstreamPathComponent = '/' + ($upstreamNoScheme.Split('/', 2)[1])
-        $needsRewrite = ($upstreamPathComponent -ne $path)
-    } else {
-        $needsRewrite = $true
-    }
-
-    # Validate path
+    # Validate path for nginx-safe characters
     $isValid = Test-NginxPath $path
     if (-not $isValid) {
         $badChars = Get-InvalidChars $path
@@ -190,40 +191,117 @@ foreach ($repo in $repos) {
             RepoKey = $repoKey
             InvalidChars = $badChars
         }
+        continue  # Skip invalid paths entirely
     }
 
-    $routes += [PSCustomObject]@{
+    # Determine upstream
+    if ($UpstreamFqdn) {
+        $upstream = "$RewriteScheme`://$UpstreamFqdn$path"
+    } else {
+        if ($repoUrlField) {
+            $upstream = $repoUrlField
+        } else {
+            $upHost = ($FQDN -replace '^https?://', '').Split('/')[0]
+            $upstream = "$RewriteScheme`://$upHost$path"
+        }
+    }
+
+    # Determine needs_rewrite
+    $upstreamNoScheme = $upstream -replace '^https?://', ''
+    if ($upstreamNoScheme.Contains('/')) {
+        $upstreamPathComponent = '/' + ($upstreamNoScheme.Split('/', 2)[1]).TrimEnd('/')
+        $needsRewrite = ($upstreamPathComponent -ne $path)
+    } else {
+        $needsRewrite = $true
+    }
+
+    # Deduplicate: prefer security-checked registries over passthrough
+    if ($seenPaths.ContainsKey($path)) {
+        $existingIdx = $seenPaths[$path]
+        $existingRoute = $allRoutes[$existingIdx]
+        if ($existingRoute.Registry -eq 'passthrough' -and $registry -ne 'passthrough') {
+            # Upgrade passthrough to real registry
+            Write-Verbose "Upgrading $path from passthrough to $registry (repo=$repoKey)"
+            $allRoutes[$existingIdx] = [PSCustomObject]@{
+                Path = $path
+                Upstream = $upstream
+                Registry = $registry
+                NeedsRewrite = $needsRewrite
+                RepoKey = $repoKey
+            }
+        } else {
+            $skippedDuplicates++
+            Write-Verbose "Duplicate skipped: $path ($registry) from repo=$repoKey"
+        }
+        continue
+    }
+
+    $seenPaths[$path] = $allRoutes.Count
+    $allRoutes += [PSCustomObject]@{
         Path = $path
         Upstream = $upstream
         Registry = $registry
         NeedsRewrite = $needsRewrite
-        IsValid = $isValid
         RepoKey = $repoKey
     }
 }
 
-# --- Report ---
+# ============================================================================
+# Summary Report
+# ============================================================================
 Write-Host ""
 Write-Host "=== ROUTE SUMMARY ===" -ForegroundColor Cyan
-Write-Host "Total routes:        $($routes.Count)"
-Write-Host "Valid routes:        $(($routes | Where-Object { $_.IsValid }).Count)" -ForegroundColor Green
-Write-Host "Invalid routes:      $($invalidPaths.Count)" -ForegroundColor $(if ($invalidPaths.Count -gt 0) { 'Red' } else { 'Green' })
-Write-Host "Passthrough (unsupported): $skippedUnsupported"
+Write-Host "Total repos fetched: $($response.Count)"
+Write-Host "Unique routes:       $($allRoutes.Count)" -ForegroundColor Green
+Write-Host "  Security-checked:  $(($allRoutes | Where-Object { $_.Registry -ne 'passthrough' }).Count)" -ForegroundColor Green
+Write-Host "  Passthrough:       $(($allRoutes | Where-Object { $_.Registry -eq 'passthrough' }).Count)"
+Write-Host "Duplicates removed:  $skippedDuplicates" -ForegroundColor Yellow
+Write-Host "Invalid paths:       $($invalidPaths.Count)" -ForegroundColor $(if ($invalidPaths.Count -gt 0) { 'Red' } else { 'Green' })
+Write-Host "Unsupported types:   $skippedUnsupported (mapped to passthrough)"
 Write-Host "Filtered out:        $skippedFiltered"
 Write-Host ""
 
 if ($invalidPaths.Count -gt 0) {
-    Write-Host "=== INVALID PATHS (will be skipped by config generator) ===" -ForegroundColor Red
+    Write-Host "=== INVALID PATHS (skipped) ===" -ForegroundColor Red
     foreach ($inv in $invalidPaths) {
-        Write-Host "  INVALID: $($inv.Path)" -ForegroundColor Red
+        Write-Host "  INVALID: '$($inv.Path)'" -ForegroundColor Red
         Write-Host "    Repo:  $($inv.RepoKey)" -ForegroundColor Yellow
         Write-Host "    Chars: $($inv.InvalidChars)" -ForegroundColor Yellow
     }
     Write-Host ""
 }
 
-# --- Generate nginx config preview ---
-$lineNum = 1
+if ($allRoutes.Count -eq 0) {
+    Write-Warning "No valid routes generated from Artifactory repositories"
+    exit 1
+}
+
+# ============================================================================
+# Registry Breakdown
+# ============================================================================
+Write-Host "=== REGISTRY BREAKDOWN ===" -ForegroundColor Cyan
+$allRoutes | Group-Object Registry | Sort-Object Count -Descending | ForEach-Object {
+    Write-Host ("  {0,-15} {1,4} routes" -f $_.Name, $_.Count)
+}
+Write-Host ""
+
+# ============================================================================
+# Generate Routes YAML (for socket.yml routes_file)
+# ============================================================================
+$yamlRoutes = @()
+foreach ($r in $allRoutes) {
+    $yamlRoutes += "- path: $($r.Path)"
+    $yamlRoutes += "  upstream: $($r.Upstream)"
+    $yamlRoutes += "  registry: $($r.Registry)"
+    $yamlRoutes += ''
+}
+$yamlRoutes -join "`r`n" | Out-File -FilePath $OutputFile -Encoding UTF8
+Write-Host "Routes YAML written to: $OutputFile" -ForegroundColor Green
+
+# ============================================================================
+# Generate Nginx Config Preview (for debugging)
+# ============================================================================
+$lineNum = 0
 $config = [System.Text.StringBuilder]::new()
 
 function Add-Line {
@@ -232,11 +310,10 @@ function Add-Line {
     [void]$config.AppendLine($line)
 }
 
-# Header
 Add-Line "# Auto-generated path-routing.conf preview"
 Add-Line "# Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-Add-Line "# Routes: $($routes.Count) total, $(($routes | Where-Object { $_.IsValid }).Count) valid"
-Add-Line "# Source: $ApiUrl"
+Add-Line "# Unique routes: $($allRoutes.Count) (from $($response.Count) repos, $skippedDuplicates duplicates removed)"
+Add-Line "# Source: $FQDN"
 Add-Line ""
 Add-Line "server {"
 Add-Line "    listen $HttpPort;"
@@ -246,15 +323,15 @@ Add-Line ""
 
 $routeLineMap = @{}
 
-foreach ($r in ($routes | Where-Object { $_.IsValid })) {
+foreach ($r in $allRoutes) {
     $path = $r.Path
     $upstream = $r.Upstream
     $registry = $r.Registry
     $needsRewrite = $r.NeedsRewrite
     
-    $routeStartLine = $lineNum + 1  # +1 because Add-Line increments after
+    $routeStartLine = $lineNum + 1
 
-    # Generate rewrite rules
+    # Rewrite rules
     $rewriteBlock = ""
     if ($needsRewrite) {
         $rewriteBlock = @"
@@ -263,7 +340,7 @@ foreach ($r in ($routes | Where-Object { $_.IsValid })) {
 "@
     }
 
-    # Registry-specific location blocks
+    # Registry-specific location blocks (matches Python builders)
     switch ($registry) {
         'npm' {
             Add-Line "    location $path {"
@@ -378,19 +455,15 @@ if ($UpstreamFqdn) {
 Add-Line "    }"
 Add-Line "}"
 
-# Write config
-$config.ToString() | Out-File -FilePath $OutputFile -Encoding UTF8
-$totalLines = $lineNum
-
-Write-Host "=== CONFIG GENERATED ===" -ForegroundColor Cyan
-Write-Host "Output file: $OutputFile"
-Write-Host "Total lines: $totalLines"
+# Write nginx preview
+$config.ToString() | Out-File -FilePath $NginxPreviewFile -Encoding UTF8
+Write-Host "Nginx preview written to: $NginxPreviewFile ($lineNum lines)" -ForegroundColor Green
 Write-Host ""
 
-# --- Find route at a specific line number (for debugging errors) ---
+# ============================================================================
+# Route Line Map (for debugging nginx errors at specific line numbers)
+# ============================================================================
 Write-Host "=== ROUTE LINE MAP ===" -ForegroundColor Cyan
-Write-Host "Use this to find which route is at a specific line number:"
-Write-Host ""
 $sortedRoutes = $routeLineMap.GetEnumerator() | Sort-Object { $_.Value.StartLine }
 foreach ($entry in $sortedRoutes) {
     $info = $entry.Value
@@ -399,16 +472,19 @@ foreach ($entry in $sortedRoutes) {
 
 Write-Host ""
 Write-Host "=== QUICK LOOKUP ===" -ForegroundColor Cyan
-Write-Host 'To find the route at a specific line (e.g., line 6822):'
-Write-Host '  $content = Get-Content path-routing-preview.conf'
+Write-Host "To find the route at a specific line (e.g., line 6822):"
+Write-Host "  `$content = Get-Content $NginxPreviewFile"
 Write-Host '  $content[6820..6825]  # Show lines around 6822'
 Write-Host ""
 
+# ============================================================================
+# Final Status
+# ============================================================================
 if ($invalidPaths.Count -gt 0) {
-    Write-Host "WARNING: $($invalidPaths.Count) routes have invalid paths and would cause nginx errors!" -ForegroundColor Red
-    Write-Host "These routes are EXCLUDED from the generated config." -ForegroundColor Yellow
-    Write-Host "Fix the repository names in Artifactory or add them to exclude_pattern." -ForegroundColor Yellow
+    Write-Host "WARNING: $($invalidPaths.Count) routes had invalid paths and were excluded." -ForegroundColor Red
+    Write-Host "Fix the repository names in Artifactory or add them to -ExcludePattern." -ForegroundColor Yellow
+    Write-Host ""
 }
 
-Write-Host ""
-Write-Host "Done." -ForegroundColor Green
+Write-Host "SUCCESS: $($allRoutes.Count) unique routes generated ($skippedDuplicates duplicates removed)" -ForegroundColor Green
+exit 0
